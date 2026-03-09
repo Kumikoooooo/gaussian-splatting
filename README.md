@@ -163,6 +163,20 @@ python train.py -s <path to COLMAP or NeRF Synthetic dataset>
   IP to start GUI server on, ```127.0.0.1``` by default.
   #### --port 
   Port to use for GUI server, ```6009``` by default.
+  #### --web_viewer
+  Enables a lightweight browser viewer (SSE over HTTP) for training previews.
+  #### --web_viewer_host
+  Host to bind the browser viewer to, ```127.0.0.1``` by default.
+  #### --web_viewer_port
+  Port for browser viewer, ```7007``` by default.
+  #### --web_viewer_every
+  Publish one preview frame every N iterations, ```50``` by default.
+  #### --web_viewer_camera_idx
+  Initial train camera index for browser preview, ```0``` by default.
+  #### --web_viewer_quality
+  JPEG quality for browser preview frames in [1, 100], ```80``` by default.
+  #### --web_viewer_debug
+  Print browser viewer debug logs (SSE connection/disconnection, frame publish and latest-frame requests).
   #### --test_iterations
   Space-separated iterations at which the training script computes L1 and PSNR over test set, ```7000 30000``` by default.
   #### --save_iterations
