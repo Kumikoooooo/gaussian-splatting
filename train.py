@@ -22,6 +22,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from utils.web_viewer import WebViewerServer, tensor_to_jpeg_data_url
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -40,7 +41,7 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, web_viewer_args=None):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -57,6 +58,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+    web_viewer = None
+    if web_viewer_args and web_viewer_args.enabled:
+        web_viewer = WebViewerServer(
+            web_viewer_args.host,
+            web_viewer_args.port,
+            initial_camera_index=web_viewer_args.camera_idx,
+            camera_count=len(scene.getTrainCameras()),
+            debug=web_viewer_args.debug,
+        )
+        web_viewer.start()
+        print(f"Web viewer available at http://{web_viewer_args.host}:{web_viewer_args.port}")
+        if web_viewer_args.debug:
+            print(
+                f"[WebViewer] Runtime config: every={web_viewer_args.every}, "
+                f"camera_idx={web_viewer_args.camera_idx}, quality={web_viewer_args.quality}"
+            )
+
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
@@ -69,6 +87,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_Ll1depth_for_log = 0.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    web_frames_published = 0
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
@@ -189,6 +208,43 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
+            should_publish_web_frame = web_viewer is not None and iteration % web_viewer_args.every == 0
+            if should_publish_web_frame:
+                # Defensive guard: keep viewer diagnostics from crashing training even if
+                # this variable was accidentally removed/moved during local edits.
+                if 'web_frames_published' not in locals():
+                    web_frames_published = 0
+                train_cameras = scene.getTrainCameras()
+                if len(train_cameras) > 0:
+                    web_viewer.set_camera_count(len(train_cameras))
+                    selected_index = web_viewer.get_camera_index()
+                    preview_cam = train_cameras[selected_index]
+                    preview = render(
+                        preview_cam,
+                        gaussians,
+                        pipe,
+                        background,
+                        use_trained_exp=dataset.train_test_exp,
+                        separate_sh=SPARSE_ADAM_AVAILABLE
+                    )["render"]
+                    if preview_cam.alpha_mask is not None:
+                        preview *= preview_cam.alpha_mask.cuda()
+                    encoded_preview = tensor_to_jpeg_data_url(preview, quality=web_viewer_args.quality)
+                    web_viewer.publish_frame(encoded_preview, iteration, selected_index, preview_cam.image_name)
+                    web_frames_published += 1
+
+            if web_viewer is not None and web_viewer_args.debug:
+                if iteration % max(100, web_viewer_args.every * 20) == 0:
+                    print(
+                        f"[WebViewer] heartbeat: iter={iteration}, every={web_viewer_args.every}, "
+                        f"published={web_frames_published}, should_publish={should_publish_web_frame}"
+                    )
+                if iteration >= 500 and web_frames_published == 0 and iteration % 100 == 0:
+                    print(
+                        "[WebViewer] WARNING: no frame has been published yet. "
+                        "Please verify --web_viewer_every value and publish branch execution."
+                    )
+
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
@@ -265,6 +321,13 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
+    parser.add_argument('--web_viewer', action='store_true', default=False, help="Enable lightweight browser viewer on top of training loop")
+    parser.add_argument('--web_viewer_host', type=str, default="127.0.0.1")
+    parser.add_argument('--web_viewer_port', type=int, default=7007)
+    parser.add_argument('--web_viewer_every', type=int, default=50, help="Push one frame every N iterations")
+    parser.add_argument('--web_viewer_camera_idx', type=int, default=0)
+    parser.add_argument('--web_viewer_quality', type=int, default=80)
+    parser.add_argument('--web_viewer_debug', action='store_true', default=False, help="Print web viewer debug information (SSE connect/disconnect, frame publish, latest fetch)")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
@@ -279,7 +342,16 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    web_viewer_args = Namespace(
+        enabled=args.web_viewer,
+        host=args.web_viewer_host,
+        port=args.web_viewer_port,
+        every=max(1, args.web_viewer_every),
+        camera_idx=max(0, args.web_viewer_camera_idx),
+        quality=min(100, max(1, args.web_viewer_quality)),
+        debug=args.web_viewer_debug,
+    )
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, web_viewer_args)
 
     # All done
     print("\nTraining complete.")
